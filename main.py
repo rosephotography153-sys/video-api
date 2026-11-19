@@ -1,5 +1,6 @@
 import ipaddress
 import logging
+import os
 import socket
 from urllib.parse import urlsplit
 
@@ -17,7 +18,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["POST"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -31,11 +32,36 @@ class VideoFormat(BaseModel):
     url: str
 
 
+class AdConfig(BaseModel):
+    banner: bool
+    interstitial: bool
+    rewarded: bool
+
+
 class ExtractResponse(BaseModel):
     title: str
     thumbnail_url: str | None
     duration: float | None
     formats: list[VideoFormat]
+    ad_config: AdConfig
+
+
+def _environment_flag(name: str, default: str) -> bool:
+    value = os.getenv(name, default).strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _get_ad_config() -> AdConfig:
+    return AdConfig(
+        banner=_environment_flag("SHOW_BANNER", "true"),
+        interstitial=_environment_flag("SHOW_INTERSTITIAL", "false"),
+        rewarded=_environment_flag("SHOW_REWARDED", "false"),
+    )
+
+
+@app.get("/ad-config", response_model=AdConfig)
+def get_ad_config() -> AdConfig:
+    return _get_ad_config()
 
 
 def _ensure_public_url(url: str) -> None:
@@ -107,4 +133,5 @@ def extract_video(request: ExtractRequest) -> ExtractResponse:
         thumbnail_url=info.get("thumbnail"),
         duration=info.get("duration"),
         formats=formats,
+        ad_config=_get_ad_config(),
     )
