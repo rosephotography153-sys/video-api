@@ -4,8 +4,6 @@ import logging
 import os
 import re
 import socket
-import subprocess
-import sys
 import threading
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -13,7 +11,7 @@ import yt_dlp
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import AnyHttpUrl, BaseModel
+from pydantic import AnyHttpUrl, BaseModel, Field
 from yt_dlp.utils import DownloadError
 
 logger = logging.getLogger(__name__)
@@ -44,6 +42,7 @@ class VideoFormat(BaseModel):
     url: str
     media_format: str = "MP4"
     file_size: str | None = None
+    http_headers: dict[str, str] = Field(default_factory=dict)
 
 
 class AdConfig(BaseModel):
@@ -81,41 +80,6 @@ def _get_ad_config() -> AdConfig:
         interstitial=_environment_flag("SHOW_INTERSTITIAL", "false"),
         rewarded=_environment_flag("SHOW_REWARDED", "false"),
     )
-
-
-def _upgrade_ytdlp() -> None:
-    try:
-        process = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "--quiet",
-                "--upgrade",
-                "--pre",
-                "yt-dlp",
-            ]
-        )
-    except OSError:
-        logger.exception("Could not start the background yt-dlp upgrade")
-        return
-
-    logger.info("Started background yt-dlp upgrade (pid=%s)", process.pid)
-    return_code = process.wait()
-    if return_code:
-        logger.error("The background yt-dlp upgrade exited with code %s", return_code)
-    else:
-        logger.info("The background yt-dlp upgrade completed")
-
-
-@app.on_event("startup")
-def start_ytdlp_upgrade() -> None:
-    threading.Thread(
-        target=_upgrade_ytdlp,
-        name="yt-dlp-upgrade",
-        daemon=True,
-    ).start()
 
 
 def _is_youtube_url(url: str) -> bool:
@@ -247,6 +211,35 @@ def _format_file_size(item: dict, duration: float | None) -> str | None:
     return f"{value:.1f} {units[unit_index]}"
 
 
+def _format_http_headers(item: dict, referer_url: str) -> dict[str, str]:
+    raw_headers = item.get("http_headers")
+    headers = raw_headers if isinstance(raw_headers, dict) else {}
+    user_agent = next(
+        (
+            value
+            for name, value in headers.items()
+            if isinstance(name, str)
+            and name.lower() == "user-agent"
+            and isinstance(value, str)
+        ),
+        None,
+    )
+    referer = next(
+        (
+            value
+            for name, value in headers.items()
+            if isinstance(name, str)
+            and name.lower() == "referer"
+            and isinstance(value, str)
+        ),
+        None,
+    )
+    return {
+        "User-Agent": user_agent or yt_dlp.utils.std_headers["User-Agent"],
+        "Referer": referer or referer_url,
+    }
+
+
 @app.get("/ad-config", response_model=AdConfig)
 def get_ad_config() -> AdConfig:
     return _get_ad_config()
@@ -321,6 +314,9 @@ def extract_video(
     duration = info.get("duration")
     if not isinstance(duration, (int, float)):
         duration = None
+    referer_url = info.get("webpage_url")
+    if not isinstance(referer_url, str) or not referer_url:
+        referer_url = extraction_url
     best_formats: dict[str, tuple[tuple[float, float], VideoFormat]] = {}
     for item in info.get("formats") or []:
         if item.get("protocol") not in {"http", "https"} or not item.get("url"):
@@ -343,6 +339,7 @@ def extract_video(
             url=item["url"],
             media_format=media_format,
             file_size=file_size,
+            http_headers=_format_http_headers(item, referer_url),
         )
         rank = (
             float(item.get("tbr") or 0),
