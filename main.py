@@ -1,3 +1,4 @@
+import hmac
 import ipaddress
 import logging
 import os
@@ -5,14 +6,18 @@ import socket
 from urllib.parse import urlsplit
 
 import yt_dlp
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import AnyHttpUrl, BaseModel
 from yt_dlp.utils import DownloadError
 
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Video Metadata API")
+_OFFICIAL_RELEASE_SHA256 = (
+    "B8:9E:89:B8:44:6E:C2:D5:8F:72:19:3E:17:AC:EE:2E:D8:C8:81:45:87:5B:27:82:46:24:A4:0D:D7:A3:B1:F8"
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -51,6 +56,16 @@ def _environment_flag(name: str, default: str) -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
+def _is_official_app_signature(signature: str | None) -> bool:
+    if signature is None:
+        return False
+    normalized_signature = signature.strip().upper()
+    return normalized_signature.isascii() and hmac.compare_digest(
+        normalized_signature,
+        _OFFICIAL_RELEASE_SHA256,
+    )
+
+
 def _get_ad_config() -> AdConfig:
     return AdConfig(
         banner=_environment_flag("SHOW_BANNER", "true"),
@@ -82,7 +97,18 @@ def _ensure_public_url(url: str) -> None:
 
 
 @app.post("/extract", response_model=ExtractResponse)
-def extract_video(request: ExtractRequest) -> ExtractResponse:
+def extract_video(
+    request: ExtractRequest,
+    x_app_signature: str | None = Header(default=None),
+) -> ExtractResponse | JSONResponse:
+    if _environment_flag("ENFORCE_SIGNATURE", "true") and not _is_official_app_signature(
+        x_app_signature
+    ):
+        return JSONResponse(
+            status_code=403,
+            content={"error": "Modified APK detected. Please use the official app."},
+        )
+
     url = str(request.url)
     _ensure_public_url(url)
 
