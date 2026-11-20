@@ -8,6 +8,7 @@ import os
 import re
 import socket
 import threading
+import time
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import yt_dlp
@@ -30,6 +31,9 @@ _youtube_cookies_configured = False
 _youtube_cookie_count = 0
 _youtube_cookie_parse_error: str | None = None
 _NETSCAPE_COOKIE_HEADER = "# Netscape HTTP Cookie File"
+_EXTRACT_CACHE_TTL_SECONDS = 10 * 60
+_extract_cache_lock = threading.Lock()
+_extract_cache: dict[str, tuple[float, ExtractResponse]] = {}
 
 app.add_middleware(
     CORSMiddleware,
@@ -414,6 +418,35 @@ def _format_http_headers(item: dict, referer_url: str) -> dict[str, str]:
     }
 
 
+def _get_cached_extract_response(url: str) -> ExtractResponse | None:
+    now = time.monotonic()
+    with _extract_cache_lock:
+        cached = _extract_cache.get(url)
+        if cached is None:
+            return None
+        expires_at, response = cached
+        if expires_at <= now:
+            del _extract_cache[url]
+            return None
+        return response.copy(deep=True, update={"ad_config": _get_ad_config()})
+
+
+def _cache_extract_response(url: str, response: ExtractResponse) -> None:
+    now = time.monotonic()
+    with _extract_cache_lock:
+        expired_urls = [
+            cached_url
+            for cached_url, (expires_at, _) in _extract_cache.items()
+            if expires_at <= now
+        ]
+        for cached_url in expired_urls:
+            del _extract_cache[cached_url]
+        _extract_cache[url] = (
+            now + _EXTRACT_CACHE_TTL_SECONDS,
+            response.copy(deep=True),
+        )
+
+
 @app.get("/ad-config", response_model=AdConfig)
 def get_ad_config() -> AdConfig:
     return _get_ad_config()
@@ -461,6 +494,10 @@ def extract_video(
         )
 
     url = str(request.url)
+    extraction_url = _strip_youtube_tracking(url)
+    cached_response = _get_cached_extract_response(extraction_url)
+    if cached_response is not None:
+        return cached_response
     _ensure_public_url(url)
 
     options = {
@@ -468,22 +505,19 @@ def extract_video(
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
-        "socket_timeout": 15,
+        "writesubtitles": False,
+        "socket_timeout": 12,
         "check_formats": False,
         "ignore_no_formats_error": True,
     }
-    extraction_url = _strip_youtube_tracking(url)
     cookie_file = None
     if _is_youtube_url(extraction_url):
         cookie_file = _write_youtube_cookies()
         if cookie_file is not None:
             options["cookiefile"] = cookie_file
-            player_clients = ["tv", "web_safari", "mweb", "web"]
-        else:
-            player_clients = ["mweb", "android_vr", "tv_embedded", "web"]
         options["extractor_args"] = {
             "youtube": {
-                "player_client": player_clients,
+                "player_client": ["tv", "web"],
             }
         }
 
@@ -496,7 +530,7 @@ def extract_video(
             retry_options.pop("cookiefile", None)
             retry_options["extractor_args"] = {
                 "youtube": {
-                    "player_client": ["tv", "android_vr", "mweb"],
+                    "player_client": ["tv", "web"],
                 }
             }
             try:
@@ -577,14 +611,11 @@ def extract_video(
         )
 
     if best_audio is not None:
-        progressive_resolutions = {
-            _resolution_label(item, "MP4", "video") for item in progressive_mp4
-        }
         video_only_by_resolution: dict[str, dict] = {}
         for item in video_only_mp4:
             height = _format_height(item)
             resolution = _resolution_label(item, "MP4", "video")
-            if height is None or height < 720 or resolution in progressive_resolutions:
+            if height not in {720, 1080}:
                 continue
             current = video_only_by_resolution.get(resolution)
             rank = (
@@ -655,7 +686,7 @@ def extract_video(
                     (info, fallback_extension, fallback_media_type, None)
                 ]
 
-    best_formats: dict[str, tuple[tuple[float, float], VideoFormat]] = {}
+    best_formats: dict[tuple[str, bool], tuple[tuple[float, float], VideoFormat]] = {}
     for item, media_format, media_type, audio_item in selected_items:
         resolution = _resolution_label(item, media_format, media_type)
         file_size = _format_file_size(item, duration)
@@ -675,12 +706,10 @@ def extract_video(
             ),
         )
         rank = format_rank(item)
-        current = best_formats.get(resolution)
-        if current is None or (audio_item is None, rank) > (
-            current[1].requires_mux is False,
-            current[0],
-        ):
-            best_formats[resolution] = (rank, candidate)
+        format_key = (resolution, candidate.requires_mux)
+        current = best_formats.get(format_key)
+        if current is None or rank > current[0]:
+            best_formats[format_key] = (rank, candidate)
 
     formats = [format_option for _, format_option in best_formats.values()]
     formats.sort(
@@ -692,10 +721,12 @@ def extract_video(
         reverse=False,
     )
 
-    return ExtractResponse(
+    response = ExtractResponse(
         title=info.get("title") or "Untitled video",
         thumbnail_url=info.get("thumbnail"),
         duration=duration,
         formats=formats,
         ad_config=_get_ad_config(),
     )
+    _cache_extract_response(extraction_url, response)
+    return response
