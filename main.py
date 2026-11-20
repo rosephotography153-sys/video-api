@@ -50,7 +50,9 @@ class ExtractRequest(BaseModel):
 
 class VideoFormat(BaseModel):
     resolution: str
+    quality: str
     url: str
+    ext: str
     media_format: str = "MP4"
     media_type: str = "video"
     file_size: str | None = None
@@ -372,6 +374,20 @@ def _resolution_label(item: dict, media_format: str, media_type: str) -> str:
 
 
 def _format_file_size(item: dict, duration: float | None) -> str | None:
+    size = _format_size_bytes(item, duration)
+    if size is None:
+        return None
+
+    units = ("B", "KB", "MB", "GB", "TB")
+    value = size
+    unit_index = 0
+    while value >= 1000 and unit_index < len(units) - 1:
+        value /= 1000
+        unit_index += 1
+    return f"{value:.1f} {units[unit_index]}"
+
+
+def _format_size_bytes(item: dict, duration: float | None) -> float | None:
     size = item.get("filesize") or item.get("filesize_approx")
     if not isinstance(size, (int, float)) or size <= 0:
         bitrate = item.get("tbr")
@@ -379,14 +395,7 @@ def _format_file_size(item: dict, duration: float | None) -> str | None:
             size = bitrate * 1000 * duration / 8
     if not isinstance(size, (int, float)) or size <= 0:
         return None
-
-    units = ("B", "KB", "MB", "GB", "TB")
-    value = float(size)
-    unit_index = 0
-    while value >= 1000 and unit_index < len(units) - 1:
-        value /= 1000
-        unit_index += 1
-    return f"{value:.1f} {units[unit_index]}"
+    return float(size)
 
 
 def _format_http_headers(item: dict, referer_url: str) -> dict[str, str]:
@@ -517,7 +526,7 @@ def extract_video(
             options["cookiefile"] = cookie_file
         options["extractor_args"] = {
             "youtube": {
-                "player_client": ["tv", "web"],
+                "player_client": ["web_safari", "mweb", "web"],
             }
         }
 
@@ -525,12 +534,12 @@ def extract_video(
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(extraction_url, download=False)
     except DownloadError as error:
-        if cookie_file is not None:
+        if _is_youtube_url(extraction_url):
             retry_options = options.copy()
             retry_options.pop("cookiefile", None)
             retry_options["extractor_args"] = {
                 "youtube": {
-                    "player_client": ["tv", "web"],
+                    "player_client": ["android_vr", "mweb"],
                 }
             }
             try:
@@ -568,13 +577,14 @@ def extract_video(
     legacy_audio_formats = []
     for item in source_formats:
         media_url = item.get("url")
+        if not isinstance(media_url, str) or not media_url:
+            continue
         protocol = str(item.get("protocol") or "").lower()
+        parsed_media_url = urlsplit(media_url)
         if (
             protocol not in {"http", "https"}
-            or not isinstance(media_url, str)
-            or not media_url
-            or protocol in {"m3u8", "m3u8_native"}
-            or urlsplit(media_url).path.lower().endswith(".m3u8")
+            or parsed_media_url.scheme.lower() not in {"http", "https"}
+            or parsed_media_url.path.lower().endswith(".m3u8")
         ):
             continue
 
@@ -593,7 +603,10 @@ def extract_video(
         elif extension == "mp3" and has_audio and not has_video:
             legacy_audio_formats.append((item, "MP3"))
 
-    selected_items = [(item, "MP4", "video", None) for item in progressive_mp4]
+    selected_items = [
+        (item, "MP4", "video", None, "mp4")
+        for item in progressive_mp4
+    ]
 
     def format_rank(item: dict) -> tuple[float, float]:
         return (
@@ -603,38 +616,28 @@ def extract_video(
 
     best_audio = max(audio_only_mp4, key=format_rank, default=None)
     if best_audio is not None:
-        selected_items.append((best_audio, "M4A", "audio", None))
+        selected_items.append((best_audio, "M4A", "audio", None, "m4a"))
     else:
         selected_items.extend(
-            (item, media_format, "audio", None)
+            (item, media_format, "audio", None, media_format.lower())
             for item, media_format in legacy_audio_formats
         )
 
     if best_audio is not None:
-        video_only_by_resolution: dict[str, dict] = {}
+        video_only_by_height: dict[int, dict] = {}
         for item in video_only_mp4:
             height = _format_height(item)
-            resolution = _resolution_label(item, "MP4", "video")
-            if height not in {720, 1080}:
+            codec = str(item.get("vcodec") or "").lower()
+            if height is None or height < 480 or not codec.startswith("avc1"):
                 continue
-            current = video_only_by_resolution.get(resolution)
-            rank = (
-                "avc1" in str(item.get("vcodec") or "").lower(),
-                *format_rank(item),
-            )
-            current_rank = (
-                (
-                    "avc1" in str(current.get("vcodec") or "").lower(),
-                    *format_rank(current),
-                )
-                if current is not None
-                else None
-            )
+            current = video_only_by_height.get(height)
+            rank = format_rank(item)
+            current_rank = format_rank(current) if current is not None else None
             if current_rank is None or rank > current_rank:
-                video_only_by_resolution[resolution] = item
+                video_only_by_height[height] = item
         selected_items.extend(
-            (item, "MP4", "video", best_audio)
-            for item in video_only_by_resolution.values()
+            (item, "MP4", "video", best_audio, "mp4")
+            for item in video_only_by_height.values()
         )
 
     if not selected_items:
@@ -666,7 +669,13 @@ def extract_video(
                 else "video"
             )
             selected_items = [
-                (fallback_item, fallback_extension, fallback_media_type, None)
+                (
+                    fallback_item,
+                    fallback_extension,
+                    fallback_media_type,
+                    None,
+                    str(fallback_item.get("ext") or fallback_extension).lower(),
+                )
             ]
         else:
             top_level_url = info.get("url")
@@ -683,16 +692,33 @@ def extract_video(
                     else "video"
                 )
                 selected_items = [
-                    (info, fallback_extension, fallback_media_type, None)
+                    (
+                        info,
+                        fallback_extension,
+                        fallback_media_type,
+                        None,
+                        str(info.get("ext") or fallback_extension).lower(),
+                    )
                 ]
 
-    best_formats: dict[tuple[str, bool], tuple[tuple[float, float], VideoFormat]] = {}
-    for item, media_format, media_type, audio_item in selected_items:
+    formats_by_url: dict[str, VideoFormat] = {}
+    for item, media_format, media_type, audio_item, extension in selected_items:
         resolution = _resolution_label(item, media_format, media_type)
-        file_size = _format_file_size(item, duration)
+        if audio_item is not None:
+            video_size = _format_size_bytes(item, duration)
+            audio_size = _format_size_bytes(audio_item, duration)
+            file_size = (
+                _format_file_size({"filesize": video_size + audio_size}, None)
+                if video_size is not None and audio_size is not None
+                else None
+            )
+        else:
+            file_size = _format_file_size(item, duration)
         candidate = VideoFormat(
             resolution=resolution,
+            quality=resolution,
             url=item["url"],
+            ext=extension,
             media_format=media_format,
             media_type=media_type,
             file_size=file_size,
@@ -705,13 +731,9 @@ def extract_video(
                 else {}
             ),
         )
-        rank = format_rank(item)
-        format_key = (resolution, candidate.requires_mux)
-        current = best_formats.get(format_key)
-        if current is None or rank > current[0]:
-            best_formats[format_key] = (rank, candidate)
+        formats_by_url.setdefault(item["url"], candidate)
 
-    formats = [format_option for _, format_option in best_formats.values()]
+    formats = list(formats_by_url.values())
     formats.sort(
         key=lambda item: (
             item.media_format != "MP4",
