@@ -51,6 +51,9 @@ class VideoFormat(BaseModel):
     media_type: str = "video"
     file_size: str | None = None
     http_headers: dict[str, str] = Field(default_factory=dict)
+    requires_mux: bool = False
+    audio_url: str | None = None
+    audio_http_headers: dict[str, str] = Field(default_factory=dict)
 
 
 class AdConfig(BaseModel):
@@ -348,7 +351,7 @@ def _format_height(item: dict) -> int | None:
 
 def _resolution_label(item: dict, media_format: str, media_type: str) -> str:
     if media_type == "audio":
-        return f"Audio ({media_format})"
+        return "Audio"
 
     height = _format_height(item)
     if height is None:
@@ -527,7 +530,8 @@ def extract_video(
     source_formats = info.get("formats") or []
     progressive_mp4 = []
     video_only_mp4 = []
-    audio_formats = []
+    audio_only_mp4 = []
+    legacy_audio_formats = []
     for item in source_formats:
         media_url = item.get("url")
         protocol = str(item.get("protocol") or "").lower()
@@ -549,25 +553,58 @@ def extract_video(
             elif has_video:
                 video_only_mp4.append(item)
             elif has_audio:
-                audio_formats.append((item, "M4A"))
+                audio_only_mp4.append(item)
         elif extension == "m4a" and has_audio and not has_video:
-            audio_formats.append((item, "M4A"))
+            audio_only_mp4.append(item)
         elif extension == "mp3" and has_audio and not has_video:
-            audio_formats.append((item, "MP3"))
+            legacy_audio_formats.append((item, "MP3"))
 
-    selected_items = [
-        (item, "MP4", "video") for item in progressive_mp4
-    ] + [(item, media_format, "audio") for item, media_format in audio_formats]
-    if not progressive_mp4 and video_only_mp4:
-        video_only_mp4.sort(
-            key=lambda item: (
-                item.get("height") or 0,
-                item.get("tbr") or 0,
-                item.get("filesize") or item.get("filesize_approx") or 0,
-            ),
-            reverse=True,
+    selected_items = [(item, "MP4", "video", None) for item in progressive_mp4]
+
+    def format_rank(item: dict) -> tuple[float, float]:
+        return (
+            float(item.get("tbr") or 0),
+            float(item.get("filesize") or item.get("filesize_approx") or 0),
         )
-        selected_items.append((video_only_mp4[0], "MP4", "video"))
+
+    best_audio = max(audio_only_mp4, key=format_rank, default=None)
+    if best_audio is not None:
+        selected_items.append((best_audio, "M4A", "audio", None))
+    else:
+        selected_items.extend(
+            (item, media_format, "audio", None)
+            for item, media_format in legacy_audio_formats
+        )
+
+    if best_audio is not None:
+        progressive_resolutions = {
+            _resolution_label(item, "MP4", "video") for item in progressive_mp4
+        }
+        video_only_by_resolution: dict[str, dict] = {}
+        for item in video_only_mp4:
+            height = _format_height(item)
+            resolution = _resolution_label(item, "MP4", "video")
+            if height is None or height < 720 or resolution in progressive_resolutions:
+                continue
+            current = video_only_by_resolution.get(resolution)
+            rank = (
+                "avc1" in str(item.get("vcodec") or "").lower(),
+                *format_rank(item),
+            )
+            current_rank = (
+                (
+                    "avc1" in str(current.get("vcodec") or "").lower(),
+                    *format_rank(current),
+                )
+                if current is not None
+                else None
+            )
+            if current_rank is None or rank > current_rank:
+                video_only_by_resolution[resolution] = item
+        selected_items.extend(
+            (item, "MP4", "video", best_audio)
+            for item in video_only_by_resolution.values()
+        )
 
     if not selected_items:
         playable_formats = [
@@ -598,7 +635,7 @@ def extract_video(
                 else "video"
             )
             selected_items = [
-                (fallback_item, fallback_extension, fallback_media_type)
+                (fallback_item, fallback_extension, fallback_media_type, None)
             ]
         else:
             top_level_url = info.get("url")
@@ -615,11 +652,11 @@ def extract_video(
                     else "video"
                 )
                 selected_items = [
-                    (info, fallback_extension, fallback_media_type)
+                    (info, fallback_extension, fallback_media_type, None)
                 ]
 
     best_formats: dict[str, tuple[tuple[float, float], VideoFormat]] = {}
-    for item, media_format, media_type in selected_items:
+    for item, media_format, media_type, audio_item in selected_items:
         resolution = _resolution_label(item, media_format, media_type)
         file_size = _format_file_size(item, duration)
         candidate = VideoFormat(
@@ -629,13 +666,20 @@ def extract_video(
             media_type=media_type,
             file_size=file_size,
             http_headers=_format_http_headers(item, referer_url),
+            requires_mux=audio_item is not None,
+            audio_url=audio_item.get("url") if audio_item is not None else None,
+            audio_http_headers=(
+                _format_http_headers(audio_item, referer_url)
+                if audio_item is not None
+                else {}
+            ),
         )
-        rank = (
-            float(item.get("tbr") or 0),
-            float(item.get("filesize") or item.get("filesize_approx") or 0),
-        )
+        rank = format_rank(item)
         current = best_formats.get(resolution)
-        if current is None or rank > current[0]:
+        if current is None or (audio_item is None, rank) > (
+            current[1].requires_mux is False,
+            current[0],
+        ):
             best_formats[resolution] = (rank, candidate)
 
     formats = [format_option for _, format_option in best_formats.values()]
