@@ -1,3 +1,6 @@
+import base64
+import binascii
+import http.cookiejar
 import hmac
 import ipaddress
 import logging
@@ -23,6 +26,10 @@ _OFFICIAL_RELEASE_SHA256 = (
 _YOUTUBE_COOKIES_PATH = "/tmp/cookies.txt"
 _youtube_cookies_lock = threading.Lock()
 _written_youtube_cookies: str | None = None
+_youtube_cookies_configured = False
+_youtube_cookie_count = 0
+_youtube_cookie_parse_error: str | None = None
+_NETSCAPE_COOKIE_HEADER = "# Netscape HTTP Cookie File"
 
 app.add_middleware(
     CORSMiddleware,
@@ -133,24 +140,34 @@ def _strip_youtube_tracking(url: str) -> str:
 
 def _write_youtube_cookies() -> str | None:
     global _written_youtube_cookies
+    global _youtube_cookies_configured
+    global _youtube_cookie_count
+    global _youtube_cookie_parse_error
+
     raw_cookie_content = os.getenv("YOUTUBE_COOKIES")
-    if raw_cookie_content is None:
+    cookie_content = _strip_cookie_quotes(raw_cookie_content or "")
+    cookie_content = _decode_base64_cookie_content(cookie_content)
+    if not cookie_content:
+        with _youtube_cookies_lock:
+            _written_youtube_cookies = None
+            _youtube_cookies_configured = False
+            _youtube_cookie_count = 0
+            _youtube_cookie_parse_error = None
         return None
-    cookie_content = raw_cookie_content.strip()
-    if (
-        len(cookie_content) >= 2
-        and cookie_content[0] == cookie_content[-1]
-        and cookie_content[0] in {"'", '"'}
-    ):
-        cookie_content = cookie_content[1:-1].strip()
     cookie_content = _reconstruct_flattened_cookies(cookie_content)
 
     with _youtube_cookies_lock:
+        _youtube_cookies_configured = True
+
         if (
             cookie_content == _written_youtube_cookies
             and os.path.isfile(_YOUTUBE_COOKIES_PATH)
         ):
-            return _YOUTUBE_COOKIES_PATH
+            return (
+                _YOUTUBE_COOKIES_PATH
+                if _youtube_cookie_count > 0 and _youtube_cookie_parse_error is None
+                else None
+            )
         try:
             file_descriptor = os.open(
                 _YOUTUBE_COOKIES_PATH,
@@ -168,32 +185,113 @@ def _write_youtube_cookies() -> str | None:
             ) from None
 
         _written_youtube_cookies = cookie_content
-        return _YOUTUBE_COOKIES_PATH
+        cookie_jar = http.cookiejar.MozillaCookieJar(_YOUTUBE_COOKIES_PATH)
+        try:
+            cookie_jar.load(ignore_discard=True, ignore_expires=True)
+        except (http.cookiejar.LoadError, OSError, UnicodeError, ValueError) as error:
+            _youtube_cookie_count = 0
+            _youtube_cookie_parse_error = str(error)[:300] or "Invalid Netscape cookie file."
+        else:
+            _youtube_cookie_count = len(cookie_jar)
+            _youtube_cookie_parse_error = None
+
+        return (
+            _YOUTUBE_COOKIES_PATH
+            if _youtube_cookie_count > 0 and _youtube_cookie_parse_error is None
+            else None
+        )
+
+
+def _strip_cookie_quotes(content: str) -> str:
+    content = content.strip()
+    if (
+        len(content) >= 2
+        and content[0] == content[-1]
+        and content[0] in {"'", '"'}
+    ):
+        return content[1:-1].strip()
+    return content
+
+
+def _decode_base64_cookie_content(content: str) -> str:
+    compact_content = "".join(content.split())
+    if not compact_content or not re.fullmatch(r"[A-Za-z0-9+/]*={0,2}", compact_content):
+        return content
+
+    padded_content = compact_content + "=" * (-len(compact_content) % 4)
+    try:
+        decoded = base64.b64decode(padded_content, validate=True).decode("utf-8").strip()
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return content
+
+    normalized_decoded = _reconstruct_flattened_cookies(decoded)
+    normalized_lines = normalized_decoded.splitlines()
+    has_header = decoded.lstrip().startswith(_NETSCAPE_COOKIE_HEADER)
+    has_cookie_rows = any(
+        _is_netscape_cookie_row(line)
+        for line in normalized_lines[1:]
+        if not line.startswith("#")
+    )
+    if has_header or has_cookie_rows:
+        return _strip_cookie_quotes(decoded)
+    return content
+
+
+def _is_netscape_cookie_row(line: str) -> bool:
+    parts = line.strip().split(None, 6)
+    return len(parts) == 7 and _is_cookie_row_start(parts, 0)
+
+
+def _is_cookie_row_start(fields: list[str], index: int) -> bool:
+    return (
+        index + 4 < len(fields)
+        and fields[index + 1].upper() in {"TRUE", "FALSE"}
+        and fields[index + 2].startswith("/")
+        and fields[index + 3].upper() in {"TRUE", "FALSE"}
+        and re.fullmatch(r"-?\d+", fields[index + 4]) is not None
+    )
 
 
 def _reconstruct_flattened_cookies(content: str) -> str:
-    if "\n" in content or "\r" in content:
-        return content.replace("\r\n", "\n").replace("\r", "\n")
+    content = content.replace("\r\n", "\n").replace("\r", "\n").strip()
+    content = re.sub(
+        r"^# Netscape HTTP Cookie File(?:\s+|$)",
+        "",
+        content,
+        count=1,
+    )
 
-    fields = content.split()
+    comments = []
     cookie_rows = []
-    index = 0
-    while index + 6 < len(fields):
-        domain, include_subdomains, path, secure, expiry = fields[index : index + 5]
-        if (
-            include_subdomains.upper() in {"TRUE", "FALSE"}
-            and path.startswith("/")
-            and secure.upper() in {"TRUE", "FALSE"}
-            and expiry.isdigit()
-        ):
-            cookie_rows.append("\t".join(fields[index : index + 7]))
-            index += 7
-        else:
-            index += 1
+    for line in content.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("#") and not line.startswith("#HttpOnly_"):
+            comments.append(line)
+            continue
 
-    if not cookie_rows:
-        return content
-    return "# Netscape HTTP Cookie File\n" + "\n".join(cookie_rows) + "\n"
+        fields = line.split()
+        row_starts = [
+            index
+            for index in range(len(fields) - 4)
+            if _is_cookie_row_start(fields, index)
+        ]
+        if len(row_starts) > 1 and row_starts[0] == 0:
+            for index, start in enumerate(row_starts):
+                end = (
+                    row_starts[index + 1]
+                    if index + 1 < len(row_starts)
+                    else len(fields)
+                )
+                parts = " ".join(fields[start:end]).strip().split(None, 6)
+                cookie_rows.append("\t".join(parts))
+            continue
+
+        parts = line.strip().split(None, 6)
+        cookie_rows.append("\t".join(parts))
+
+    return "\n".join([_NETSCAPE_COOKIE_HEADER, *comments, *cookie_rows]) + "\n"
 
 
 def _clean_ytdlp_error(error: DownloadError) -> str:
@@ -318,6 +416,17 @@ def get_ad_config() -> AdConfig:
     return _get_ad_config()
 
 
+@app.get("/cookie-status")
+def get_cookie_status() -> dict[str, bool | int | str | None]:
+    _write_youtube_cookies()
+    with _youtube_cookies_lock:
+        return {
+            "cookies_configured": _youtube_cookies_configured,
+            "youtube_cookie_count": _youtube_cookie_count,
+            "parse_error": _youtube_cookie_parse_error,
+        }
+
+
 def _ensure_public_url(url: str) -> None:
     hostname = urlsplit(url).hostname
     if not hostname:
@@ -360,14 +469,17 @@ def extract_video(
     }
     extraction_url = _strip_youtube_tracking(url)
     if _is_youtube_url(extraction_url):
-        options["extractor_args"] = {
-            "youtube": {
-                "player_client": ["mweb", "android_vr", "tv_embedded", "web"],
-            }
-        }
         cookie_file = _write_youtube_cookies()
         if cookie_file is not None:
             options["cookiefile"] = cookie_file
+            player_clients = ["web", "mweb", "tv_embedded"]
+        else:
+            player_clients = ["mweb", "android_vr", "tv_embedded", "web"]
+        options["extractor_args"] = {
+            "youtube": {
+                "player_client": player_clients,
+            }
+        }
 
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
