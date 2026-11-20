@@ -143,6 +143,7 @@ def _write_youtube_cookies() -> str | None:
         and cookie_content[0] in {"'", '"'}
     ):
         cookie_content = cookie_content[1:-1].strip()
+    cookie_content = _reconstruct_flattened_cookies(cookie_content)
 
     with _youtube_cookies_lock:
         if (
@@ -168,6 +169,40 @@ def _write_youtube_cookies() -> str | None:
 
         _written_youtube_cookies = cookie_content
         return _YOUTUBE_COOKIES_PATH
+
+
+def _reconstruct_flattened_cookies(content: str) -> str:
+    if "\n" in content or "\r" in content:
+        return content.replace("\r\n", "\n").replace("\r", "\n")
+
+    fields = content.split()
+    cookie_rows = []
+    index = 0
+    while index + 6 < len(fields):
+        domain, include_subdomains, path, secure, expiry = fields[index : index + 5]
+        if (
+            include_subdomains.upper() in {"TRUE", "FALSE"}
+            and path.startswith("/")
+            and secure.upper() in {"TRUE", "FALSE"}
+            and expiry.isdigit()
+        ):
+            cookie_rows.append("\t".join(fields[index : index + 7]))
+            index += 7
+        else:
+            index += 1
+
+    if not cookie_rows:
+        return content
+    return "# Netscape HTTP Cookie File\n" + "\n".join(cookie_rows) + "\n"
+
+
+def _clean_ytdlp_error(error: DownloadError) -> str:
+    message = str(error).strip()
+    message = re.sub(r"\x1b\[[0-9;]*m", "", message)
+    message = re.sub(r"^(?:ERROR:\s*)+", "", message, flags=re.IGNORECASE)
+    message = re.sub(r"https?://\S+", "[URL]", message)
+    message = re.sub(r"\s+", " ", message).strip()
+    return message[:300] or "yt-dlp could not extract video metadata."
 
 
 def _format_height(item: dict) -> int | None:
@@ -321,12 +356,13 @@ def extract_video(
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
+        "socket_timeout": 15,
     }
     extraction_url = _strip_youtube_tracking(url)
     if _is_youtube_url(extraction_url):
         options["extractor_args"] = {
             "youtube": {
-                "player_client": ["android_vr", "ios", "tv_embedded", "web"],
+                "player_client": ["mweb", "android_vr", "tv_embedded", "web"],
             }
         }
         cookie_file = _write_youtube_cookies()
@@ -336,11 +372,12 @@ def extract_video(
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(extraction_url, download=False)
-    except DownloadError:
-        logger.error("yt-dlp could not extract video metadata")
+    except DownloadError as error:
+        clean_error = _clean_ytdlp_error(error)
+        logger.error("yt-dlp extraction failed: %s", clean_error)
         raise HTTPException(
             status_code=502,
-            detail="Unable to extract video information from the provided URL.",
+            detail=clean_error,
         ) from None
 
     if not isinstance(info, dict):
