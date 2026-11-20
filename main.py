@@ -41,6 +41,7 @@ class VideoFormat(BaseModel):
     resolution: str
     url: str
     media_format: str = "MP4"
+    media_type: str = "video"
     file_size: str | None = None
     http_headers: dict[str, str] = Field(default_factory=dict)
 
@@ -94,17 +95,54 @@ def _strip_youtube_tracking(url: str) -> str:
         return url
 
     parsed = urlsplit(url)
-    query = urlencode(
-        [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True) if key != "si"]
+    query = [
+        (key, value)
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        if key != "si"
+    ]
+    hostname = (parsed.hostname or "").lower()
+    path_segments = [segment for segment in parsed.path.split("/") if segment]
+
+    video_id = None
+    if hostname == "youtu.be" and path_segments:
+        video_id = path_segments[0]
+    elif (
+        hostname.endswith("youtube.com")
+        and len(path_segments) >= 2
+        and path_segments[0] == "shorts"
+    ):
+        video_id = path_segments[1]
+
+    if video_id:
+        query = [("v", video_id)] + [
+            (key, value) for key, value in query if key != "v"
+        ]
+        return urlunsplit(
+            ("https", "www.youtube.com", "/watch", urlencode(query), "")
+        )
+
+    if hostname.endswith("youtube.com") and parsed.path.rstrip("/") == "/watch":
+        return urlunsplit(
+            ("https", "www.youtube.com", "/watch", urlencode(query), "")
+        )
+
+    return urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment)
     )
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, parsed.fragment))
 
 
 def _write_youtube_cookies() -> str | None:
     global _written_youtube_cookies
-    cookie_content = os.getenv("YOUTUBE_COOKIES")
-    if cookie_content is None:
+    raw_cookie_content = os.getenv("YOUTUBE_COOKIES")
+    if raw_cookie_content is None:
         return None
+    cookie_content = raw_cookie_content.strip()
+    if (
+        len(cookie_content) >= 2
+        and cookie_content[0] == cookie_content[-1]
+        and cookie_content[0] in {"'", '"'}
+    ):
+        cookie_content = cookie_content[1:-1].strip()
 
     with _youtube_cookies_lock:
         if (
@@ -175,8 +213,8 @@ def _format_height(item: dict) -> int | None:
     return None
 
 
-def _resolution_label(item: dict, media_format: str) -> str:
-    if media_format != "MP4":
+def _resolution_label(item: dict, media_format: str, media_type: str) -> str:
+    if media_type == "audio":
         return f"Audio ({media_format})"
 
     height = _format_height(item)
@@ -317,27 +355,90 @@ def extract_video(
     referer_url = info.get("webpage_url")
     if not isinstance(referer_url, str) or not referer_url:
         referer_url = extraction_url
-    best_formats: dict[str, tuple[tuple[float, float], VideoFormat]] = {}
-    for item in info.get("formats") or []:
-        if item.get("protocol") not in {"http", "https"} or not item.get("url"):
+    source_formats = info.get("formats") or []
+    progressive_mp4 = []
+    audio_formats = []
+    for item in source_formats:
+        media_url = item.get("url")
+        protocol = str(item.get("protocol") or "").lower()
+        if (
+            protocol not in {"http", "https"}
+            or not isinstance(media_url, str)
+            or not media_url
+            or protocol in {"m3u8", "m3u8_native"}
+            or urlsplit(media_url).path.lower().endswith(".m3u8")
+        ):
             continue
 
-        extension = item.get("ext")
-        has_video = bool(item.get("vcodec")) and item.get("vcodec") != "none"
-        has_audio = bool(item.get("acodec")) and item.get("acodec") != "none"
-        if extension == "mp4" and has_video:
-            media_format = "MP4"
+        extension = str(item.get("ext") or "").lower()
+        has_video = item.get("vcodec") not in {None, "none"}
+        has_audio = item.get("acodec") not in {None, "none"}
+        if extension == "mp4":
+            progressive_mp4.append(item)
         elif extension in {"mp3", "m4a"} and has_audio and not has_video:
-            media_format = extension.upper()
-        else:
-            continue
+            audio_formats.append(item)
 
-        resolution = _resolution_label(item, media_format)
+    selected_items = [
+        (item, "MP4", "video") for item in progressive_mp4
+    ] + [(item, str(item.get("ext")).upper(), "audio") for item in audio_formats]
+    if not progressive_mp4:
+        playable_formats = [
+            item
+            for item in source_formats
+            if item.get("protocol") in {"http", "https"}
+            and isinstance(item.get("url"), str)
+            and item.get("url")
+            and not urlsplit(item["url"]).path.lower().endswith(".m3u8")
+            and item.get("protocol") not in {"m3u8", "m3u8_native"}
+        ]
+        playable_formats.sort(
+            key=lambda item: (
+                item.get("vcodec") in {None, "none"},
+                item.get("height") or 0,
+                item.get("tbr") or 0,
+                item.get("filesize") or item.get("filesize_approx") or 0,
+            ),
+            reverse=True,
+        )
+        if playable_formats:
+            fallback_item = playable_formats[0]
+            fallback_extension = str(fallback_item.get("ext") or "MP4").upper()
+            fallback_media_type = (
+                "audio"
+                if fallback_item.get("vcodec") == "none"
+                or fallback_extension in {"MP3", "M4A"}
+                else "video"
+            )
+            selected_items = [
+                (fallback_item, fallback_extension, fallback_media_type)
+            ]
+        else:
+            top_level_url = info.get("url")
+            if (
+                isinstance(top_level_url, str)
+                and top_level_url
+                and not urlsplit(top_level_url).path.lower().endswith(".m3u8")
+            ):
+                fallback_extension = str(info.get("ext") or "MP4").upper()
+                fallback_media_type = (
+                    "audio"
+                    if info.get("vcodec") == "none"
+                    or fallback_extension in {"MP3", "M4A"}
+                    else "video"
+                )
+                selected_items = [
+                    (info, fallback_extension, fallback_media_type)
+                ]
+
+    best_formats: dict[str, tuple[tuple[float, float], VideoFormat]] = {}
+    for item, media_format, media_type in selected_items:
+        resolution = _resolution_label(item, media_format, media_type)
         file_size = _format_file_size(item, duration)
         candidate = VideoFormat(
             resolution=resolution,
             url=item["url"],
             media_format=media_format,
+            media_type=media_type,
             file_size=file_size,
             http_headers=_format_http_headers(item, referer_url),
         )
