@@ -466,13 +466,16 @@ def extract_video(
         "skip_download": True,
         "noplaylist": True,
         "socket_timeout": 15,
+        "check_formats": False,
+        "ignore_no_formats_error": True,
     }
     extraction_url = _strip_youtube_tracking(url)
+    cookie_file = None
     if _is_youtube_url(extraction_url):
         cookie_file = _write_youtube_cookies()
         if cookie_file is not None:
             options["cookiefile"] = cookie_file
-            player_clients = ["web", "mweb", "tv_embedded"]
+            player_clients = ["tv", "web_safari", "mweb", "web"]
         else:
             player_clients = ["mweb", "android_vr", "tv_embedded", "web"]
         options["extractor_args"] = {
@@ -485,12 +488,29 @@ def extract_video(
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(extraction_url, download=False)
     except DownloadError as error:
-        clean_error = _clean_ytdlp_error(error)
-        logger.error("yt-dlp extraction failed: %s", clean_error)
-        raise HTTPException(
-            status_code=502,
-            detail=clean_error,
-        ) from None
+        if cookie_file is not None:
+            retry_options = options.copy()
+            retry_options.pop("cookiefile", None)
+            retry_options["extractor_args"] = {
+                "youtube": {
+                    "player_client": ["tv", "android_vr", "mweb"],
+                }
+            }
+            try:
+                with yt_dlp.YoutubeDL(retry_options) as ydl:
+                    info = ydl.extract_info(extraction_url, download=False)
+            except DownloadError as retry_error:
+                error = retry_error
+            else:
+                error = None
+
+        if error is not None:
+            clean_error = _clean_ytdlp_error(error)
+            logger.error("yt-dlp extraction failed: %s", clean_error)
+            raise HTTPException(
+                status_code=502,
+                detail=clean_error,
+            ) from None
 
     if not isinstance(info, dict):
         raise HTTPException(
@@ -506,6 +526,7 @@ def extract_video(
         referer_url = extraction_url
     source_formats = info.get("formats") or []
     progressive_mp4 = []
+    video_only_mp4 = []
     audio_formats = []
     for item in source_formats:
         media_url = item.get("url")
@@ -523,14 +544,32 @@ def extract_video(
         has_video = item.get("vcodec") not in {None, "none"}
         has_audio = item.get("acodec") not in {None, "none"}
         if extension == "mp4":
-            progressive_mp4.append(item)
-        elif extension in {"mp3", "m4a"} and has_audio and not has_video:
-            audio_formats.append(item)
+            if has_video and has_audio:
+                progressive_mp4.append(item)
+            elif has_video:
+                video_only_mp4.append(item)
+            elif has_audio:
+                audio_formats.append((item, "M4A"))
+        elif extension == "m4a" and has_audio and not has_video:
+            audio_formats.append((item, "M4A"))
+        elif extension == "mp3" and has_audio and not has_video:
+            audio_formats.append((item, "MP3"))
 
     selected_items = [
         (item, "MP4", "video") for item in progressive_mp4
-    ] + [(item, str(item.get("ext")).upper(), "audio") for item in audio_formats]
-    if not progressive_mp4:
+    ] + [(item, media_format, "audio") for item, media_format in audio_formats]
+    if not progressive_mp4 and video_only_mp4:
+        video_only_mp4.sort(
+            key=lambda item: (
+                item.get("height") or 0,
+                item.get("tbr") or 0,
+                item.get("filesize") or item.get("filesize_approx") or 0,
+            ),
+            reverse=True,
+        )
+        selected_items.append((video_only_mp4[0], "MP4", "video"))
+
+    if not selected_items:
         playable_formats = [
             item
             for item in source_formats
