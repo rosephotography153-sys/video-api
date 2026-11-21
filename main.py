@@ -63,6 +63,12 @@ class VideoFormat(BaseModel):
 
 
 class AdConfig(BaseModel):
+    ads_enabled: bool
+    startio_app_id: str
+    latest_version: int
+    force_update: bool
+    update_reason: str
+    website_url: str
     banner: bool
     interstitial: bool
     rewarded: bool
@@ -93,6 +99,12 @@ def _is_official_app_signature(signature: str | None) -> bool:
 
 def _get_ad_config() -> AdConfig:
     return AdConfig(
+        ads_enabled=os.getenv("ADS_ENABLED", "false").lower() == "true",
+        startio_app_id=os.getenv("STARTIO_APP_ID", ""),
+        latest_version=int(os.getenv("LATEST_VERSION", "1")),
+        force_update=os.getenv("FORCE_UPDATE", "true").lower() == "true",
+        update_reason=os.getenv("UPDATE_REASON", ""),
+        website_url=os.getenv("WEBSITE_URL", "https://example.com"),
         banner=_environment_flag("SHOW_BANNER", "true"),
         interstitial=_environment_flag("SHOW_INTERSTITIAL", "false"),
         rewarded=_environment_flag("SHOW_REWARDED", "false"),
