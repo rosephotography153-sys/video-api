@@ -601,8 +601,8 @@ def extract_video(
             continue
 
         extension = str(item.get("ext") or "").lower()
-        has_video = item.get("vcodec") not in {None, "none"}
-        has_audio = item.get("acodec") not in {None, "none"}
+        has_video = item.get("vcodec") != "none"
+        has_audio = item.get("acodec") != "none"
         if extension == "mp4":
             if has_video and has_audio:
                 progressive_mp4.append(item)
@@ -610,7 +610,11 @@ def extract_video(
                 video_only_mp4.append(item)
             elif has_audio:
                 audio_only_mp4.append(item)
-        elif extension == "m4a" and has_audio and not has_video:
+        elif (
+            extension == "m4a"
+            and has_audio
+            and item.get("vcodec") in {None, "none"}
+        ):
             audio_only_mp4.append(item)
         elif extension == "mp3" and has_audio and not has_video:
             legacy_audio_formats.append((item, "MP3"))
@@ -635,22 +639,25 @@ def extract_video(
             for item, media_format in legacy_audio_formats
         )
 
-    if best_audio is not None:
-        video_only_by_height: dict[int, dict] = {}
-        for item in video_only_mp4:
-            height = _format_height(item)
-            codec = str(item.get("vcodec") or "").lower()
-            if height is None or height < 480 or not codec.startswith("avc1"):
-                continue
-            current = video_only_by_height.get(height)
-            rank = format_rank(item)
-            current_rank = format_rank(current) if current is not None else None
-            if current_rank is None or rank > current_rank:
-                video_only_by_height[height] = item
-        selected_items.extend(
-            (item, "MP4", "video", best_audio, "mp4")
-            for item in video_only_by_height.values()
-        )
+    video_only_by_height: dict[int, dict] = {}
+    for item in video_only_mp4:
+        height = _format_height(item)
+        codec = str(item.get("vcodec") or "").lower()
+        if (
+            height is None
+            or height < 360
+            or (codec and not codec.startswith(("avc1", "h264")))
+        ):
+            continue
+        current = video_only_by_height.get(height)
+        rank = format_rank(item)
+        current_rank = format_rank(current) if current is not None else None
+        if current_rank is None or rank > current_rank:
+            video_only_by_height[height] = item
+    selected_items.extend(
+        (item, "MP4", "video", best_audio, "mp4")
+        for item in video_only_by_height.values()
+    )
 
     if not selected_items:
         playable_formats = [
