@@ -118,6 +118,14 @@ def _is_youtube_url(url: str) -> bool:
     ) or hostname in {"youtube.com", "youtube-nocookie.com"}
 
 
+def _is_facebook_url(url: str) -> bool:
+    hostname = (urlsplit(url).hostname or "").lower()
+    return (
+        hostname in {"facebook.com", "fb.com", "fb.watch"}
+        or hostname.endswith((".facebook.com", ".fb.com"))
+    )
+
+
 def _strip_youtube_tracking(url: str) -> str:
     if not _is_youtube_url(url):
         return url
@@ -410,7 +418,12 @@ def _format_size_bytes(item: dict, duration: float | None) -> float | None:
     return float(size)
 
 
-def _format_http_headers(item: dict, referer_url: str) -> dict[str, str]:
+def _format_http_headers(
+    item: dict,
+    referer_url: str,
+    *,
+    facebook: bool = False,
+) -> dict[str, str]:
     raw_headers = item.get("http_headers")
     headers = raw_headers if isinstance(raw_headers, dict) else {}
     user_agent = next(
@@ -433,10 +446,18 @@ def _format_http_headers(item: dict, referer_url: str) -> dict[str, str]:
         ),
         None,
     )
-    return {
+    result = {
         "User-Agent": user_agent or yt_dlp.utils.std_headers["User-Agent"],
-        "Referer": referer or referer_url,
+        "Referer": (
+            "https://www.facebook.com/"
+            if facebook
+            else referer or referer_url
+        ),
     }
+    if facebook:
+        result["Accept"] = "*/*"
+        result["Connection"] = "keep-alive"
+    return result
 
 
 def _get_cached_extract_response(url: str) -> ExtractResponse | None:
@@ -531,6 +552,14 @@ def extract_video(
         "check_formats": False,
         "ignore_no_formats_error": True,
     }
+    is_facebook = _is_facebook_url(extraction_url)
+    if is_facebook:
+        options["http_headers"] = {
+            "User-Agent": yt_dlp.utils.std_headers["User-Agent"],
+            "Referer": "https://www.facebook.com/",
+            "Accept": "*/*",
+            "Connection": "keep-alive",
+        }
     cookie_file = None
     if _is_youtube_url(extraction_url):
         cookie_file = _write_youtube_cookies()
@@ -630,34 +659,44 @@ def extract_video(
             float(item.get("filesize") or item.get("filesize_approx") or 0),
         )
 
-    best_audio = max(audio_only_mp4, key=format_rank, default=None)
-    if best_audio is not None:
-        selected_items.append((best_audio, "M4A", "audio", None, "m4a"))
-    else:
-        selected_items.extend(
-            (item, media_format, "audio", None, media_format.lower())
-            for item, media_format in legacy_audio_formats
-        )
+    facebook_has_progressive = is_facebook and bool(progressive_mp4)
+    if facebook_has_progressive:
+        progressive_mp4.sort(key=format_rank, reverse=True)
+        selected_items = [
+            (item, "MP4", "video", None, "mp4")
+            for item in progressive_mp4
+        ]
 
-    video_only_by_height: dict[int, dict] = {}
-    for item in video_only_mp4:
-        height = _format_height(item)
-        codec = str(item.get("vcodec") or "").lower()
-        if (
-            height is None
-            or height < 360
-            or (codec and not codec.startswith(("avc1", "h264")))
-        ):
-            continue
-        current = video_only_by_height.get(height)
-        rank = format_rank(item)
-        current_rank = format_rank(current) if current is not None else None
-        if current_rank is None or rank > current_rank:
-            video_only_by_height[height] = item
-    selected_items.extend(
-        (item, "MP4", "video", best_audio, "mp4")
-        for item in video_only_by_height.values()
-    )
+    best_audio = max(audio_only_mp4, key=format_rank, default=None)
+    if not facebook_has_progressive:
+        if best_audio is not None:
+            selected_items.append((best_audio, "M4A", "audio", None, "m4a"))
+        else:
+            selected_items.extend(
+                (item, media_format, "audio", None, media_format.lower())
+                for item, media_format in legacy_audio_formats
+            )
+
+    if not facebook_has_progressive:
+        video_only_by_height: dict[int, dict] = {}
+        for item in video_only_mp4:
+            height = _format_height(item)
+            codec = str(item.get("vcodec") or "").lower()
+            if (
+                height is None
+                or height < 360
+                or (codec and not codec.startswith(("avc1", "h264")))
+            ):
+                continue
+            current = video_only_by_height.get(height)
+            rank = format_rank(item)
+            current_rank = format_rank(current) if current is not None else None
+            if current_rank is None or rank > current_rank:
+                video_only_by_height[height] = item
+        selected_items.extend(
+            (item, "MP4", "video", best_audio, "mp4")
+            for item in video_only_by_height.values()
+        )
 
     if not selected_items:
         playable_formats = [
@@ -741,11 +780,19 @@ def extract_video(
             media_format=media_format,
             media_type=media_type,
             file_size=file_size,
-            http_headers=_format_http_headers(item, referer_url),
+            http_headers=_format_http_headers(
+                item,
+                referer_url,
+                facebook=is_facebook,
+            ),
             requires_mux=audio_item is not None,
             audio_url=audio_item.get("url") if audio_item is not None else None,
             audio_http_headers=(
-                _format_http_headers(audio_item, referer_url)
+                _format_http_headers(
+                    audio_item,
+                    referer_url,
+                    facebook=is_facebook,
+                )
                 if audio_item is not None
                 else {}
             ),
@@ -753,14 +800,15 @@ def extract_video(
         formats_by_url.setdefault(item["url"], candidate)
 
     formats = list(formats_by_url.values())
-    formats.sort(
-        key=lambda item: (
-            item.media_format != "MP4",
-            _format_height({"format_note": item.resolution}) or 0,
-            item.media_format,
-        ),
-        reverse=False,
-    )
+    if not facebook_has_progressive:
+        formats.sort(
+            key=lambda item: (
+                item.media_format != "MP4",
+                _format_height({"format_note": item.resolution}) or 0,
+                item.media_format,
+            ),
+            reverse=False,
+        )
 
     response = ExtractResponse(
         title=info.get("title") or "Untitled video",
