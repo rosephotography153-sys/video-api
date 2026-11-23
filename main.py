@@ -3,6 +3,7 @@ import binascii
 import http.cookiejar
 import hmac
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -12,7 +13,15 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import (
+    parse_qsl,
+    parse_qs,
+    quote,
+    urlencode,
+    urljoin,
+    urlsplit,
+    urlunsplit,
+)
 
 import yt_dlp
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -41,6 +50,11 @@ _PROXY_TOKEN_TTL_SECONDS = 60 * 60
 _PROXY_TOKEN_LIMIT = 5000
 _proxy_token_lock = threading.Lock()
 _proxy_tokens: dict[str, tuple[float, str, dict[str, str], str]] = {}
+_DESKTOP_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/126.0.0.0 Safari/537.36"
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -163,6 +177,7 @@ def _proxy_host_is_allowed(hostname: str, platform: str) -> bool:
             "byteoversea.com",
             "ibytedtos.com",
             "muscdn.com",
+            "tikwm.com",
         )
     return any(
         hostname == domain or hostname.endswith(f".{domain}")
@@ -193,35 +208,148 @@ def _resolve_facebook_share_url(url: str) -> str:
     if not parsed.path.lower().startswith(("/share/v/", "/share/r/")):
         return url
 
-    class FacebookRedirectHandler(urllib.request.HTTPRedirectHandler):
+    class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, request, response, code, message, headers, new_url):
-            if not _is_facebook_url(new_url):
-                raise urllib.error.HTTPError(
-                    new_url,
-                    code,
-                    "Facebook share URL redirected outside Facebook.",
-                    headers,
-                    response,
-                )
-            _ensure_public_url(new_url)
-            return super().redirect_request(
-                request, response, code, message, headers, new_url
-            )
+            return None
 
+    def login_next_url(target: str) -> str | None:
+        target_parts = urlsplit(target)
+        if not target_parts.path.lower().startswith(("/login", "/checkpoint")):
+            return None
+        next_values = parse_qs(target_parts.query).get("next", [])
+        if not next_values:
+            return None
+        next_url = urljoin("https://www.facebook.com/", next_values[0])
+        next_parts = urlsplit(next_url)
+        if (
+            _is_facebook_url(next_url)
+            and not next_parts.path.lower().startswith(("/login", "/checkpoint"))
+        ):
+            return next_url
+        return None
+
+    current_url = url
     headers = {
-        "User-Agent": yt_dlp.utils.std_headers["User-Agent"],
+        "User-Agent": _DESKTOP_BROWSER_USER_AGENT,
+        "Referer": "https://www.facebook.com/",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
     }
-    request = urllib.request.Request(url, headers=headers)
-    opener = urllib.request.build_opener(FacebookRedirectHandler)
-    try:
-        with opener.open(request, timeout=8) as response:
-            resolved_url = response.geturl()
-    except (OSError, urllib.error.URLError, HTTPException, ValueError) as error:
-        logger.info("Could not resolve Facebook share URL before extraction: %s", error)
-        return url
+    opener = urllib.request.build_opener(NoRedirectHandler)
+    for _ in range(10):
+        if not _is_facebook_url(current_url):
+            return url
+        try:
+            _ensure_public_url(current_url)
+            request = urllib.request.Request(current_url, headers=headers)
+            with opener.open(request, timeout=8) as response:
+                status = response.status
+                location = response.headers.get("Location")
+                if 200 <= status < 300:
+                    return response.geturl()
+        except urllib.error.HTTPError as error:
+            status = error.code
+            location = error.headers.get("Location")
+            error.close()
+        except (OSError, urllib.error.URLError, HTTPException, ValueError) as error:
+            logger.info("Could not resolve Facebook share URL: %s", error)
+            return url
 
-    return resolved_url if _is_facebook_url(resolved_url) else url
+        if status not in {301, 302, 303, 307, 308} or not location:
+            return current_url
+        next_url = urljoin(current_url, location)
+        recovered_url = login_next_url(next_url)
+        if recovered_url:
+            return recovered_url
+        if not _is_facebook_url(next_url):
+            return url
+        current_url = next_url
+
+    return current_url
+
+
+def _extract_tikwm_video(url: str) -> ExtractResponse | None:
+    browser_headers = {
+        "User-Agent": _DESKTOP_BROWSER_USER_AGENT,
+        "Referer": "https://www.tikwm.com/",
+        "Accept": "application/json, text/plain, */*",
+    }
+    api_url = "https://www.tikwm.com/api/?" + urlencode(
+        {"url": url, "hd": "1"}
+    )
+    request = urllib.request.Request(api_url, headers=browser_headers)
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, TimeoutError, ValueError) as error:
+        logger.info("TikWM extraction failed; falling back to yt-dlp: %s", error)
+        return None
+
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        logger.info("TikWM returned no video data; falling back to yt-dlp.")
+        return None
+    direct_url = data.get("hdplay") or data.get("play")
+    if not isinstance(direct_url, str) or not direct_url.strip():
+        logger.info("TikWM returned no MP4 link; falling back to yt-dlp.")
+        return None
+    direct_url = urljoin("https://www.tikwm.com/", direct_url)
+
+    try:
+        _validate_proxy_target(direct_url, "tiktok")
+    except HTTPException as error:
+        logger.info(
+            "TikWM returned an unsupported media URL; falling back to yt-dlp: %s",
+            error.detail,
+        )
+        return None
+
+    raw_height = data.get("height")
+    height = int(raw_height) if isinstance(raw_height, (int, float)) else None
+    if height is not None and height > 0:
+        if height >= 1080:
+            resolution = f"Full HD ({height}p)"
+        elif height >= 720:
+            resolution = f"HD ({height}p)"
+        else:
+            resolution = f"SD ({height}p)"
+    else:
+        resolution = "Video"
+
+    duration_value = data.get("duration")
+    duration = (
+        float(duration_value)
+        if isinstance(duration_value, (int, float)) and duration_value >= 0
+        else None
+    )
+    file_size = _format_file_size(
+        {"filesize": data.get("size")},
+        duration,
+    )
+    proxy_url = _create_proxy_url(
+        direct_url,
+        browser_headers,
+        "video.mp4",
+        "tiktok",
+    )
+    return ExtractResponse(
+        title=data.get("title") or "TikTok video",
+        thumbnail_url=data.get("cover") or data.get("origin_cover"),
+        duration=duration,
+        formats=[
+            VideoFormat(
+                resolution=resolution,
+                quality=resolution,
+                url=proxy_url,
+                ext="mp4",
+                media_format="MP4",
+                media_type="video",
+                file_size=file_size,
+                http_headers=browser_headers,
+            )
+        ],
+        ad_config=_get_ad_config(),
+    )
 
 
 def _strip_youtube_tracking(url: str) -> str:
@@ -758,6 +886,11 @@ def extract_video(
     cached_response = _get_cached_extract_response(extraction_url)
     if cached_response is not None:
         return cached_response
+    if _is_tiktok_url(extraction_url):
+        tikwm_response = _extract_tikwm_video(extraction_url)
+        if tikwm_response is not None:
+            _cache_extract_response(extraction_url, tikwm_response)
+            return tikwm_response
 
     options = {
         "quiet": True,
@@ -773,7 +906,7 @@ def extract_video(
     is_tiktok = _is_tiktok_url(extraction_url)
     if is_facebook:
         options["http_headers"] = {
-            "User-Agent": yt_dlp.utils.std_headers["User-Agent"],
+            "User-Agent": _DESKTOP_BROWSER_USER_AGENT,
             "Referer": "https://www.facebook.com/",
             "Accept": "*/*",
             "Accept-Language": "en-US,en;q=0.9",
