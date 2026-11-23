@@ -9,6 +9,8 @@ import re
 import socket
 import threading
 import time
+import urllib.error
+import urllib.request
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import yt_dlp
@@ -124,6 +126,42 @@ def _is_facebook_url(url: str) -> bool:
         hostname in {"facebook.com", "fb.com", "fb.watch"}
         or hostname.endswith((".facebook.com", ".fb.com"))
     )
+
+
+def _resolve_facebook_share_url(url: str) -> str:
+    parsed = urlsplit(url)
+    if not parsed.path.lower().startswith(("/share/v/", "/share/r/")):
+        return url
+
+    class FacebookRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, request, response, code, message, headers, new_url):
+            if not _is_facebook_url(new_url):
+                raise urllib.error.HTTPError(
+                    new_url,
+                    code,
+                    "Facebook share URL redirected outside Facebook.",
+                    headers,
+                    response,
+                )
+            _ensure_public_url(new_url)
+            return super().redirect_request(
+                request, response, code, message, headers, new_url
+            )
+
+    headers = {
+        "User-Agent": yt_dlp.utils.std_headers["User-Agent"],
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    request = urllib.request.Request(url, headers=headers)
+    opener = urllib.request.build_opener(FacebookRedirectHandler)
+    try:
+        with opener.open(request, timeout=8) as response:
+            resolved_url = response.geturl()
+    except (OSError, urllib.error.URLError, HTTPException, ValueError) as error:
+        logger.info("Could not resolve Facebook share URL before extraction: %s", error)
+        return url
+
+    return resolved_url if _is_facebook_url(resolved_url) else url
 
 
 def _strip_youtube_tracking(url: str) -> str:
@@ -537,10 +575,12 @@ def extract_video(
 
     url = str(request.url)
     extraction_url = _strip_youtube_tracking(url)
+    _ensure_public_url(url)
+    if _is_facebook_url(extraction_url):
+        extraction_url = _resolve_facebook_share_url(extraction_url)
     cached_response = _get_cached_extract_response(extraction_url)
     if cached_response is not None:
         return cached_response
-    _ensure_public_url(url)
 
     options = {
         "quiet": True,
@@ -558,6 +598,7 @@ def extract_video(
             "User-Agent": yt_dlp.utils.std_headers["User-Agent"],
             "Referer": "https://www.facebook.com/",
             "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
             "Connection": "keep-alive",
         }
     cookie_file = None
@@ -593,6 +634,8 @@ def extract_video(
 
         if error is not None:
             clean_error = _clean_ytdlp_error(error)
+            if is_facebook:
+                clean_error = f"Facebook extraction failed: {clean_error}"
             logger.error("yt-dlp extraction failed: %s", clean_error)
             raise HTTPException(
                 status_code=502,

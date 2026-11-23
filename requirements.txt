@@ -1,4 +1,4 @@
-yt-dlp[default]
+yt-dlp @ https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz
 deno
 fastapi>=0.110,<1.0
 uvicorn>=0.27,<1.0
