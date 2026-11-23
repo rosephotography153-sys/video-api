@@ -6,17 +6,18 @@ import ipaddress
 import logging
 import os
 import re
+import secrets
 import socket
 import threading
 import time
 import urllib.error
 import urllib.request
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import yt_dlp
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import AnyHttpUrl, BaseModel, Field
 from yt_dlp.utils import DownloadError
 
@@ -36,6 +37,10 @@ _NETSCAPE_COOKIE_HEADER = "# Netscape HTTP Cookie File"
 _EXTRACT_CACHE_TTL_SECONDS = 10 * 60
 _extract_cache_lock = threading.Lock()
 _extract_cache: dict[str, tuple[float, ExtractResponse]] = {}
+_PROXY_TOKEN_TTL_SECONDS = 60 * 60
+_PROXY_TOKEN_LIMIT = 5000
+_proxy_token_lock = threading.Lock()
+_proxy_tokens: dict[str, tuple[float, str, dict[str, str], str]] = {}
 
 app.add_middleware(
     CORSMiddleware,
@@ -126,6 +131,61 @@ def _is_facebook_url(url: str) -> bool:
         hostname in {"facebook.com", "fb.com", "fb.watch"}
         or hostname.endswith((".facebook.com", ".fb.com"))
     )
+
+
+def _is_tiktok_url(url: str) -> bool:
+    hostname = (urlsplit(url).hostname or "").lower()
+    return hostname == "tiktok.com" or hostname.endswith(
+        (
+            ".tiktok.com",
+            ".tiktokv.com",
+            ".tiktokcdn.com",
+            ".byteoversea.com",
+            ".ibytedtos.com",
+            ".muscdn.com",
+        )
+    )
+
+
+def _proxy_host_is_allowed(hostname: str, platform: str) -> bool:
+    hostname = hostname.lower().rstrip(".")
+    if platform == "facebook":
+        allowed_domains = (
+            "facebook.com",
+            "fbcdn.net",
+            "fbsbx.com",
+        )
+    else:
+        allowed_domains = (
+            "tiktok.com",
+            "tiktokv.com",
+            "tiktokcdn.com",
+            "byteoversea.com",
+            "ibytedtos.com",
+            "muscdn.com",
+        )
+    return any(
+        hostname == domain or hostname.endswith(f".{domain}")
+        for domain in allowed_domains
+    )
+
+
+def _validate_proxy_target(url: str, platform: str) -> None:
+    parsed = urlsplit(url)
+    try:
+        port = parsed.port
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Unsupported media host.") from None
+    if (
+        parsed.scheme.lower() != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+        or not parsed.hostname
+        or not _proxy_host_is_allowed(parsed.hostname, platform)
+    ):
+        raise HTTPException(status_code=400, detail="Unsupported media host.")
+    _ensure_public_url(url)
 
 
 def _resolve_facebook_share_url(url: str) -> str:
@@ -413,13 +473,17 @@ def _format_height(item: dict) -> int | None:
     return None
 
 
-def _resolution_label(item: dict, media_format: str, media_type: str) -> str:
+def _resolution_label(
+    item: dict,
+    media_format: str,
+    media_type: str,
+) -> str | None:
     if media_type == "audio":
         return "Audio"
 
     height = _format_height(item)
     if height is None:
-        return "SD (quality unavailable)"
+        return None
     if height >= 2160:
         return f"UHD ({height}p)"
     if height >= 1440:
@@ -464,37 +528,40 @@ def _format_http_headers(
 ) -> dict[str, str]:
     raw_headers = item.get("http_headers")
     headers = raw_headers if isinstance(raw_headers, dict) else {}
-    user_agent = next(
-        (
-            value
-            for name, value in headers.items()
-            if isinstance(name, str)
-            and name.lower() == "user-agent"
-            and isinstance(value, str)
-        ),
-        None,
-    )
-    referer = next(
-        (
-            value
-            for name, value in headers.items()
-            if isinstance(name, str)
-            and name.lower() == "referer"
-            and isinstance(value, str)
-        ),
-        None,
-    )
-    result = {
-        "User-Agent": user_agent or yt_dlp.utils.std_headers["User-Agent"],
-        "Referer": (
-            "https://www.facebook.com/"
-            if facebook
-            else referer or referer_url
-        ),
+    excluded_headers = {
+        "connection",
+        "content-length",
+        "host",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
     }
+    result = {
+        name: value
+        for name, value in headers.items()
+        if isinstance(name, str)
+        and isinstance(value, str)
+        and name.lower() not in excluded_headers
+        and "\r" not in name
+        and "\n" not in name
+        and "\r" not in value
+        and "\n" not in value
+    }
+    if not any(name.lower() == "user-agent" for name in result):
+        result["User-Agent"] = yt_dlp.utils.std_headers["User-Agent"]
     if facebook:
-        result["Accept"] = "*/*"
-        result["Connection"] = "keep-alive"
+        for name in list(result):
+            if name.lower() == "referer":
+                del result[name]
+        result["Referer"] = "https://www.facebook.com/"
+        if not any(name.lower() == "accept" for name in result):
+            result["Accept"] = "*/*"
+    elif not any(name.lower() == "referer" for name in result):
+        result["Referer"] = referer_url
     return result
 
 
@@ -541,6 +608,116 @@ def get_cookie_status() -> dict[str, bool | int | str | None]:
             "youtube_cookie_count": _youtube_cookie_count,
             "parse_error": _youtube_cookie_parse_error,
         }
+
+
+def _create_proxy_url(
+    media_url: str,
+    headers: dict[str, str],
+    file_name: str,
+    platform: str,
+) -> str:
+    _validate_proxy_target(media_url, platform)
+    token = secrets.token_urlsafe(32)
+    expires_at = time.monotonic() + _PROXY_TOKEN_TTL_SECONDS
+    with _proxy_token_lock:
+        expired_tokens = [
+            cached_token
+            for cached_token, (expiry, _, _, _) in _proxy_tokens.items()
+            if expiry <= time.monotonic()
+        ]
+        for expired_token in expired_tokens:
+            del _proxy_tokens[expired_token]
+        if len(_proxy_tokens) >= _PROXY_TOKEN_LIMIT:
+            _proxy_tokens.pop(next(iter(_proxy_tokens)))
+        _proxy_tokens[token] = (expires_at, media_url, headers.copy(), file_name)
+
+    base_url = (
+        os.getenv("PUBLIC_BASE_URL", "").strip()
+        or os.getenv("RENDER_EXTERNAL_URL", "").strip()
+    ).rstrip("/")
+    if base_url:
+        return f"{base_url}/proxy?token={token}"
+    return f"/proxy?token={token}"
+
+
+@app.get("/proxy")
+def proxy_media(token: str, request: Request) -> StreamingResponse:
+    with _proxy_token_lock:
+        token_data = _proxy_tokens.get(token)
+        if token_data is None or token_data[0] <= time.monotonic():
+            _proxy_tokens.pop(token, None)
+            raise HTTPException(status_code=404, detail="The media link has expired.")
+        _, media_url, stored_headers, file_name = token_data
+        upstream_headers = stored_headers.copy()
+
+    # Keep upstream range requests supported without accepting arbitrary headers.
+    range_header = request.headers.get("range")
+    if range_header:
+        for name in list(upstream_headers):
+            if name.lower() == "range":
+                del upstream_headers[name]
+        upstream_headers["Range"] = range_header
+    platform = "facebook" if _is_facebook_url(media_url) else "tiktok"
+    _validate_proxy_target(media_url, platform)
+
+    class SafeMediaRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, response, code, message, headers, new_url):
+            _validate_proxy_target(new_url, platform)
+            return super().redirect_request(
+                req, response, code, message, headers, new_url
+            )
+
+    upstream_request = urllib.request.Request(media_url, headers=upstream_headers)
+    opener = urllib.request.build_opener(SafeMediaRedirectHandler)
+    try:
+        upstream = opener.open(upstream_request, timeout=30)
+    except urllib.error.HTTPError as error:
+        error.close()
+        raise HTTPException(
+            status_code=error.code,
+            detail="The media host rejected the download request.",
+        ) from None
+    except HTTPException:
+        raise
+    except (OSError, urllib.error.URLError, ValueError) as error:
+        logger.warning("Media proxy request failed: %s", error)
+        raise HTTPException(
+            status_code=502,
+            detail="The media host could not provide the video.",
+        ) from None
+
+    response_headers = {}
+    content_type = upstream.headers.get("Content-Type")
+    content_length = upstream.headers.get("Content-Length")
+    content_range = upstream.headers.get("Content-Range")
+    accept_ranges = upstream.headers.get("Accept-Ranges")
+    if content_type:
+        response_headers["Content-Type"] = content_type
+    if content_length:
+        response_headers["Content-Length"] = content_length
+    if content_range:
+        response_headers["Content-Range"] = content_range
+    if accept_ranges:
+        response_headers["Accept-Ranges"] = accept_ranges
+    response_headers["Content-Disposition"] = (
+        f'attachment; filename="{quote(file_name, safe="")}"'
+    )
+
+    def stream_media():
+        try:
+            while True:
+                chunk = upstream.read(1024 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            upstream.close()
+
+    return StreamingResponse(
+        stream_media(),
+        status_code=upstream.status,
+        headers=response_headers,
+    )
 
 
 def _ensure_public_url(url: str) -> None:
@@ -593,6 +770,7 @@ def extract_video(
         "ignore_no_formats_error": True,
     }
     is_facebook = _is_facebook_url(extraction_url)
+    is_tiktok = _is_tiktok_url(extraction_url)
     if is_facebook:
         options["http_headers"] = {
             "User-Agent": yt_dlp.utils.std_headers["User-Agent"],
@@ -702,8 +880,8 @@ def extract_video(
             float(item.get("filesize") or item.get("filesize_approx") or 0),
         )
 
-    facebook_has_progressive = is_facebook and bool(progressive_mp4)
-    if facebook_has_progressive:
+    platform_has_progressive = (is_facebook or is_tiktok) and bool(progressive_mp4)
+    if platform_has_progressive:
         progressive_mp4.sort(key=format_rank, reverse=True)
         selected_items = [
             (item, "MP4", "video", None, "mp4")
@@ -711,7 +889,7 @@ def extract_video(
         ]
 
     best_audio = max(audio_only_mp4, key=format_rank, default=None)
-    if not facebook_has_progressive:
+    if not platform_has_progressive:
         if best_audio is not None:
             selected_items.append((best_audio, "M4A", "audio", None, "m4a"))
         else:
@@ -720,7 +898,7 @@ def extract_video(
                 for item, media_format in legacy_audio_formats
             )
 
-    if not facebook_has_progressive:
+    if not platform_has_progressive:
         video_only_by_height: dict[int, dict] = {}
         for item in video_only_mp4:
             height = _format_height(item)
@@ -803,8 +981,38 @@ def extract_video(
                 ]
 
     formats_by_url: dict[str, VideoFormat] = {}
+    platform_items: dict[tuple[str, int | None], tuple] = {}
+    if is_facebook or is_tiktok:
+        for selected_item in selected_items:
+            item, media_format, media_type, audio_item, extension = selected_item
+            height = _format_height(item)
+            if media_type == "video" and height is None:
+                continue
+            codec = str(item.get("vcodec") or "").lower()
+            format_description = " ".join(
+                str(item.get(key) or "")
+                for key in ("format_id", "format_note", "format")
+            ).lower()
+            has_audio = item.get("acodec") not in {None, "none"} or audio_item is not None
+            rank = (
+                codec.startswith(("avc1", "h264")),
+                has_audio,
+                item.get("watermarked") is not True
+                and "watermark" not in format_description,
+                format_rank(item),
+            )
+            key = (media_type, height)
+            existing = platform_items.get(key)
+            if existing is None or rank > existing[0]:
+                platform_items[key] = (rank, selected_item)
+        selected_items = [entry[1] for entry in platform_items.values()]
+
     for item, media_format, media_type, audio_item, extension in selected_items:
+        if media_type == "video" and _format_height(item) is None:
+            continue
         resolution = _resolution_label(item, media_format, media_type)
+        if resolution is None:
+            continue
         if audio_item is not None:
             video_size = _format_size_bytes(item, duration)
             audio_size = _format_size_bytes(audio_item, duration)
@@ -815,35 +1023,54 @@ def extract_video(
             )
         else:
             file_size = _format_file_size(item, duration)
+        http_headers = _format_http_headers(
+            item,
+            referer_url,
+            facebook=is_facebook,
+        )
+        audio_http_headers = (
+            _format_http_headers(
+                audio_item,
+                referer_url,
+                facebook=is_facebook,
+            )
+            if audio_item is not None
+            else {}
+        )
+        download_url = item["url"]
+        audio_url = audio_item.get("url") if audio_item is not None else None
+        if is_facebook or is_tiktok:
+            platform = "facebook" if is_facebook else "tiktok"
+            download_url = _create_proxy_url(
+                item["url"],
+                http_headers,
+                f"video.{extension}",
+                platform,
+            )
+            if audio_url is not None:
+                audio_url = _create_proxy_url(
+                    audio_url,
+                    audio_http_headers,
+                    "audio.m4a",
+                    platform,
+                )
         candidate = VideoFormat(
             resolution=resolution,
             quality=resolution,
-            url=item["url"],
+            url=download_url,
             ext=extension,
             media_format=media_format,
             media_type=media_type,
             file_size=file_size,
-            http_headers=_format_http_headers(
-                item,
-                referer_url,
-                facebook=is_facebook,
-            ),
+            http_headers=http_headers,
             requires_mux=audio_item is not None,
-            audio_url=audio_item.get("url") if audio_item is not None else None,
-            audio_http_headers=(
-                _format_http_headers(
-                    audio_item,
-                    referer_url,
-                    facebook=is_facebook,
-                )
-                if audio_item is not None
-                else {}
-            ),
+            audio_url=audio_url,
+            audio_http_headers=audio_http_headers,
         )
-        formats_by_url.setdefault(item["url"], candidate)
+        formats_by_url.setdefault(download_url, candidate)
 
     formats = list(formats_by_url.values())
-    if not facebook_has_progressive:
+    if not platform_has_progressive:
         formats.sort(
             key=lambda item: (
                 item.media_format != "MP4",
